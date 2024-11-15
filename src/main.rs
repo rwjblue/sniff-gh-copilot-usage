@@ -1,6 +1,6 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::Parser;
-use pcap::{Capture, Device};
+use pcap::Capture;
 use signal_hook::consts::SIGINT;
 use signal_hook::flag;
 use std::collections::HashMap;
@@ -23,48 +23,62 @@ struct Cli {
 fn main() -> Result<()> {
     let cli = Cli::parse();
 
-    // Shared structure for tracking domain counts
     let lookup_counts = Arc::new(Mutex::new(HashMap::<String, usize>::new()));
-
-    // flag for <Ctrl-C> interrupt
     let running = Arc::new(AtomicBool::new(true));
     flag::register(SIGINT, running.clone())?;
 
-    // Clone references for the capture thread
     let interface = cli.interface.clone();
     let lookup_counts_ref = Arc::clone(&lookup_counts);
-
-    // Run the packet capturing in a separate thread
     let running_ref = Arc::clone(&running);
-    let capture_thread = thread::spawn(move || {
+
+    let (error_tx, error_rx) = std::sync::mpsc::channel();
+
+    let capture_thread = thread::spawn(move || -> Result<()> {
         let mut capture = Capture::from_device(interface.as_str())
-            .unwrap()
+            .context("failed to open capture device")?
             .promisc(true)
             .open()
-            .unwrap();
+            .context("failed to start capture")?;
 
         while running_ref.load(Ordering::Relaxed) {
-            if let Ok(packet) = capture.next_packet() {
-                if let Some(domain) = extract_githubcopilot_domain(&packet.data) {
-                    let mut counts = lookup_counts_ref.lock().unwrap();
-                    *counts.entry(domain).or_insert(0) += 1;
+            match capture.next_packet() {
+                Ok(packet) => {
+                    if let Some(domain) = extract_githubcopilot_domain(packet.data) {
+                        lookup_counts_ref
+                            .lock()
+                            .map_err(|e| anyhow::anyhow!("failed to acquire lock: {}", e))?
+                            .entry(domain)
+                            .and_modify(|c| *c += 1)
+                            .or_insert(1);
+                    }
+                }
+                Err(e) => {
+                    error_tx
+                        .send(anyhow::Error::new(e))
+                        .context("failed to send error")?;
+                    break;
                 }
             }
-            thread::sleep(Duration::from_millis(10)); // Avoid busy-waiting
+            thread::sleep(Duration::from_millis(10));
         }
+        Ok(())
     });
 
-    // Wait for <Ctrl-C> signal
     while running.load(Ordering::Relaxed) {
+        if let Ok(error) = error_rx.try_recv() {
+            eprintln!("Capture error: {:#}", error);
+            running.store(false, Ordering::Relaxed);
+            break;
+        }
         thread::sleep(Duration::from_secs(1));
     }
 
-    // Join the capture thread
-    capture_thread.join().unwrap();
+    running.store(false, Ordering::Relaxed);
+    capture_thread
+        .join()
+        .map_err(|e| anyhow::anyhow!("capture thread panicked: {:?}", e))??;
 
-    // Print the results
     print_lookup_table(&lookup_counts);
-
     Ok(())
 }
 
