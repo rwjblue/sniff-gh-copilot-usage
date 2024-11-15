@@ -16,8 +16,8 @@ use tracing_subscriber::EnvFilter;
 #[command(about = "Monitor DNS lookups for domains ending in githubcopilot.com")]
 struct Cli {
     /// Network interface to listen on
-    #[arg(short, long, default_value = "any")]
-    interface: String,
+    #[arg(short, long)]
+    interface: Option<String>,
 }
 
 fn main() -> Result<()> {
@@ -44,7 +44,15 @@ fn main() -> Result<()> {
 
     debug!("Registered Ctrl-C handler");
 
-    let interface = cli.interface.clone();
+    let interface = cli.interface.unwrap_or_else(|| {
+        get_default_interface()
+            .context("Failed to detect default interface")
+            .unwrap_or_else(|e| {
+                eprintln!("Warning: {}, falling back to en0", e);
+                "en0".to_string()
+            })
+    });
+
     let lookup_counts_ref = Arc::clone(&lookup_counts);
     let running_ref = Arc::clone(&running);
 
@@ -81,6 +89,15 @@ fn main() -> Result<()> {
     Ok(())
 }
 
+fn get_default_interface() -> Result<String> {
+    Device::list()
+        .map_err(|e| anyhow::anyhow!("failed to list devices: {}", e))?
+        .into_iter()
+        .next()
+        .map(|dev| dev.name)
+        .ok_or_else(|| anyhow::anyhow!("no capture devices found"))
+}
+
 fn capture_packets(
     interface: String,
     lookup_counts_ref: Arc<Mutex<HashMap<String, usize>>>,
@@ -99,7 +116,12 @@ fn capture_packets(
         }
     };
 
-    let mut capture = match device.promisc(true).timeout(100).open() {
+    let mut capture = match device
+        .promisc(true)
+        .timeout(100)
+        .immediate_mode(true)
+        .open()
+    {
         Ok(cap) => {
             debug!("capture configured successfully");
             cap
@@ -125,13 +147,16 @@ fn capture_packets(
                         .or_insert(1);
                 }
             }
+            Err(pcap::Error::TimeoutExpired) => {
+                // Timeout is expected, just continue the loop
+                continue;
+            }
             Err(e) => {
                 error!(error = %e, "packet capture error");
 
                 return Err(anyhow::anyhow!("packet capture error: {}", e));
             }
         }
-        thread::sleep(Duration::from_millis(10));
     }
     debug!("capture thread shutting down");
     Ok(())
