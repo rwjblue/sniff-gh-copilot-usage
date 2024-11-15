@@ -1,8 +1,6 @@
 use anyhow::{Context, Result};
 use clap::Parser;
-use pcap::Capture;
-use signal_hook::consts::SIGINT;
-use signal_hook::flag;
+use pcap::{Capture, Device};
 use std::collections::HashMap;
 use std::sync::Mutex;
 use std::sync::{
@@ -34,8 +32,17 @@ fn main() -> Result<()> {
 
     let lookup_counts = Arc::new(Mutex::new(HashMap::<String, usize>::new()));
     let running = Arc::new(AtomicBool::new(true));
-    flag::register(SIGINT, running.clone())?;
-    debug!("registered SIGINT handler");
+    let running_ctrl_c = Arc::clone(&running);
+    ctrlc::set_handler(move || {
+        info!("Received Ctrl-C!");
+        running_ctrl_c.store(false, Ordering::Relaxed);
+        info!(
+            "Set running to false: {}",
+            running_ctrl_c.load(Ordering::Relaxed)
+        );
+    })?;
+
+    debug!("Registered Ctrl-C handler");
 
     let interface = cli.interface.clone();
     let lookup_counts_ref = Arc::clone(&lookup_counts);

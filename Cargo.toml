@@ -6,8 +6,8 @@ edition = "2021"
 [dependencies]
 anyhow = "1.0.93"
 clap = { version = "4.5.21", features = ["derive"] }
+ctrlc = "3.4.5"
 dns-parser = "0.8.0"
 pcap = "2.2.0"
-signal-hook = "0.3.17"
 tracing = "0.1.40"
 tracing-subscriber = { version = "0.3.18", features = ["env-filter"] }
