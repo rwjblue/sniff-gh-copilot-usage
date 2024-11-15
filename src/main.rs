@@ -2,6 +2,7 @@ use anyhow::{Context, Result};
 use clap::Parser;
 use pcap::{Capture, Device};
 use std::collections::HashMap;
+use std::net::IpAddr;
 use std::sync::Mutex;
 use std::sync::{
     atomic::{AtomicBool, Ordering},
@@ -31,6 +32,7 @@ fn main() -> Result<()> {
     debug!(?cli, "starting DNS monitor");
 
     let lookup_counts = Arc::new(Mutex::new(HashMap::<String, usize>::new()));
+    let dns_results_ref = Arc::new(Mutex::new(HashMap::<String, Vec<IpAddr>>::new()));
     let running = Arc::new(AtomicBool::new(true));
     let running_ctrl_c = Arc::clone(&running);
     ctrlc::set_handler(move || {
@@ -60,7 +62,8 @@ fn main() -> Result<()> {
     debug!(interface = ?interface, "starting packet capture");
 
     let capture_thread = thread::spawn(move || -> Result<()> {
-        if let Err(e) = capture_packets(interface, lookup_counts_ref, running_ref) {
+        if let Err(e) = capture_packets(interface, lookup_counts_ref, dns_results_ref, running_ref)
+        {
             error_tx.send(e).expect("Failed to send error");
         }
 
@@ -102,6 +105,7 @@ fn get_default_interface() -> Result<String> {
 fn capture_packets(
     interface: String,
     lookup_counts_ref: Arc<Mutex<HashMap<String, usize>>>,
+    dns_results_ref: Arc<Mutex<HashMap<String, Vec<IpAddr>>>>,
     running_ref: Arc<AtomicBool>,
 ) -> Result<()> {
     debug!("attempting to open capture device: {}", interface);
@@ -142,14 +146,23 @@ fn capture_packets(
     while running_ref.load(Ordering::Relaxed) {
         match capture.next_packet() {
             Ok(packet) => {
-                if let Some(domain) = extract_githubcopilot_domain(packet.data) {
+                if let Some((domain, ips)) = extract_githubcopilot_domain(packet.data) {
                     info!(domain = %domain, "detected GitHub Copilot DNS lookup");
                     lookup_counts_ref
                         .lock()
                         .map_err(|e| anyhow::anyhow!("failed to acquire lock: {}", e))?
-                        .entry(domain)
+                        .entry(domain.clone())
                         .and_modify(|c| *c += 1)
                         .or_insert(1);
+
+                    if !ips.is_empty() {
+                        dns_results_ref
+                            .lock()
+                            .map_err(|e| anyhow::anyhow!("failed to acquire lock: {}", e))?
+                            .insert(domain.clone(), ips);
+
+                        info!(domain = %domain, "recorded DNS resolution");
+                    }
                 }
             }
             Err(pcap::Error::TimeoutExpired) => {
@@ -168,7 +181,7 @@ fn capture_packets(
 }
 
 /// Extracts domain from a DNS packet if it matches `githubcopilot.com`
-fn extract_githubcopilot_domain(packet_data: &[u8]) -> Option<String> {
+fn extract_githubcopilot_domain(packet_data: &[u8]) -> Option<(String, Vec<IpAddr>)> {
     // Skip Ethernet header (14 bytes) and IP header (20 bytes)
     if packet_data.len() < 42 {
         // 14 + 20 + 8 (UDP header)
@@ -191,7 +204,21 @@ fn extract_githubcopilot_domain(packet_data: &[u8]) -> Option<String> {
             for question in dns_packet.questions {
                 let domain = question.qname.to_string();
                 if domain.ends_with("githubcopilot.com") {
-                    return Some(domain);
+                    let mut ips = Vec::new();
+
+                    for answer in dns_packet.answers {
+                        match answer.data {
+                            dns_parser::RData::A(addr) => {
+                                ips.push(IpAddr::V4(addr.0));
+                            }
+                            dns_parser::RData::AAAA(addr) => {
+                                ips.push(IpAddr::V6(addr.0));
+                            }
+                            _ => {}
+                        }
+                    }
+
+                    return Some((domain, ips));
                 }
             }
             None
