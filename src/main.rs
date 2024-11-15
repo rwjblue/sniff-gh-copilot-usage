@@ -14,7 +14,7 @@ use tracing::{debug, error, info};
 use tracing_subscriber::EnvFilter;
 
 #[derive(Parser, Debug)]
-#[command(about = "Monitor DNS lookups for domains ending in githubcopilot.com")]
+#[command(about = "Monitor usage of domains ending in githubcopilot.com")]
 struct Cli {
     /// Network interface to listen on
     #[arg(short, long)]
@@ -29,10 +29,10 @@ fn main() -> Result<()> {
         .init();
 
     let cli = Cli::parse();
-    debug!(?cli, "starting DNS monitor");
+    debug!(?cli, "starting monitor");
 
     let lookup_counts = Arc::new(Mutex::new(HashMap::<String, usize>::new()));
-    let dns_results_ref = Arc::new(Mutex::new(HashMap::<String, Vec<IpAddr>>::new()));
+    let ip_to_domain = Arc::new(Mutex::new(HashMap::<IpAddr, String>::new()));
     let running = Arc::new(AtomicBool::new(true));
     let running_ctrl_c = Arc::clone(&running);
     ctrlc::set_handler(move || {
@@ -62,8 +62,7 @@ fn main() -> Result<()> {
     debug!(interface = ?interface, "starting packet capture");
 
     let capture_thread = thread::spawn(move || -> Result<()> {
-        if let Err(e) = capture_packets(interface, lookup_counts_ref, dns_results_ref, running_ref)
-        {
+        if let Err(e) = capture_packets(interface, lookup_counts_ref, ip_to_domain, running_ref) {
             error_tx.send(e).expect("Failed to send error");
         }
 
@@ -86,7 +85,7 @@ fn main() -> Result<()> {
         anyhow::anyhow!("capture thread panicked: {:?}", e)
     })??;
 
-    info!("DNS monitor completed successfully");
+    info!("monitor completed successfully");
     println!("\n\n");
 
     print_lookup_table(&lookup_counts);
@@ -105,7 +104,7 @@ fn get_default_interface() -> Result<String> {
 fn capture_packets(
     interface: String,
     lookup_counts_ref: Arc<Mutex<HashMap<String, usize>>>,
-    dns_results_ref: Arc<Mutex<HashMap<String, Vec<IpAddr>>>>,
+    ip_to_domain: Arc<Mutex<HashMap<IpAddr, String>>>,
     running_ref: Arc<AtomicBool>,
 ) -> Result<()> {
     debug!("attempting to open capture device: {}", interface);
@@ -140,7 +139,7 @@ fn capture_packets(
     info!("packet capture started successfully");
 
     capture
-        .filter("port 53 and (udp or tcp)", true)
+        .filter("port 53 or port 80 or port 443", true)
         .context("setting capture filter")?;
 
     while running_ref.load(Ordering::Relaxed) {
@@ -148,20 +147,33 @@ fn capture_packets(
             Ok(packet) => {
                 if let Some((domain, ips)) = extract_githubcopilot_domain(packet.data) {
                     info!(domain = %domain, "detected GitHub Copilot DNS lookup");
-                    lookup_counts_ref
-                        .lock()
-                        .map_err(|e| anyhow::anyhow!("failed to acquire lock: {}", e))?
-                        .entry(domain.clone())
-                        .and_modify(|c| *c += 1)
-                        .or_insert(1);
+                    increment_counter(&lookup_counts_ref, domain.clone())?;
 
                     if !ips.is_empty() {
-                        dns_results_ref
+                        let mut ip_domain_map = ip_to_domain
                             .lock()
-                            .map_err(|e| anyhow::anyhow!("failed to acquire lock: {}", e))?
-                            .insert(domain.clone(), ips);
+                            .map_err(|e| anyhow::anyhow!("failed to acquire lock: {}", e))?;
 
+                        // Add each resolved IP as a key mapping to this domain
+                        for ip in ips {
+                            ip_domain_map.insert(ip, domain.clone());
+                        }
                         info!(domain = %domain, "recorded DNS resolution");
+                    }
+                }
+
+                // Process HTTP/HTTPS packets
+                if let Some(payload) = skip_network_headers(packet.data) {
+                    let dest_ip = extract_dest_ip(packet.data)?;
+
+                    // Check if this IP belongs to any githubcopilot domain
+                    if let Some(domain) = ip_to_domain
+                        .lock()
+                        .map_err(|e| anyhow::anyhow!("failed to acquire lock: {}", e))?
+                        .get(&dest_ip)
+                    {
+                        info!(domain = %domain, "detected GitHub Copilot HTTP access");
+                        increment_counter(&lookup_counts_ref, domain.clone())?;
                     }
                 }
             }
@@ -178,6 +190,23 @@ fn capture_packets(
     }
     debug!("capture thread shutting down");
     Ok(())
+}
+
+fn extract_dest_ip(packet_data: &[u8]) -> Result<IpAddr> {
+    if packet_data.len() < 34 {
+        return Err(anyhow::anyhow!("packet too short"));
+    }
+
+    // Skip Ethernet header (14 bytes) and read destination IP
+    let ip_header = &packet_data[14..];
+    let dest_ip = IpAddr::V4(std::net::Ipv4Addr::new(
+        ip_header[16],
+        ip_header[17],
+        ip_header[18],
+        ip_header[19],
+    ));
+
+    Ok(dest_ip)
 }
 
 /// Extracts domain from a DNS packet if it matches `githubcopilot.com`
@@ -248,6 +277,63 @@ fn get_dns_offset(packet_data: &[u8]) -> Option<usize> {
     } else {
         Some(dns_start)
     }
+}
+
+fn skip_network_headers(packet_data: &[u8]) -> Option<&[u8]> {
+    if packet_data.len() < 34 {
+        return None;
+    }
+
+    // Ethernet header is 14 bytes
+    let eth_header_len = 14;
+    let ip_header_start = eth_header_len;
+    let ip_header = &packet_data[ip_header_start..];
+
+    if ip_header.len() < 20 {
+        return None;
+    }
+
+    // IP header length is determined by the IHL field (lower 4 bits of the first byte)
+    let ihl = ip_header[0] & 0x0F;
+    let ip_header_len = (ihl * 4) as usize;
+
+    if ip_header_len < 20 {
+        return None;
+    }
+
+    let tcp_header_start = ip_header_start + ip_header_len;
+
+    if packet_data.len() < tcp_header_start + 20 {
+        return None;
+    }
+
+    let tcp_header = &packet_data[tcp_header_start..];
+
+    // TCP header length is determined by the Data Offset field (upper 4 bits of the 13th byte)
+    let data_offset = (tcp_header[12] >> 4) & 0x0F;
+    let tcp_header_len = (data_offset * 4) as usize;
+
+    if tcp_header_len < 20 {
+        return None;
+    }
+
+    let payload_start = tcp_header_start + tcp_header_len;
+
+    if payload_start >= packet_data.len() {
+        None
+    } else {
+        Some(&packet_data[payload_start..])
+    }
+}
+
+fn increment_counter(counts: &Arc<Mutex<HashMap<String, usize>>>, key: String) -> Result<()> {
+    counts
+        .lock()
+        .map_err(|e| anyhow::anyhow!("failed to acquire lock: {}", e))?
+        .entry(key)
+        .and_modify(|c| *c += 1)
+        .or_insert(1);
+    Ok(())
 }
 
 fn print_lookup_table(lookup_counts: &Arc<Mutex<HashMap<String, usize>>>) {
