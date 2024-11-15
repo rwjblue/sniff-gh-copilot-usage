@@ -9,3 +9,5 @@ clap = { version = "4.5.21", features = ["derive"] }
 dns-parser = "0.8.0"
 pcap = "2.2.0"
 signal-hook = "0.3.17"
+tracing = "0.1.40"
+tracing-subscriber = { version = "0.3.18", features = ["env-filter"] }
