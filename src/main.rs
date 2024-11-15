@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 use clap::Parser;
 use pcap::{Capture, Device};
 use std::collections::HashMap;
-use std::net::IpAddr;
+use std::net::{IpAddr, ToSocketAddrs};
 use std::sync::Mutex;
 use std::sync::{
     atomic::{AtomicBool, Ordering},
@@ -32,7 +32,7 @@ fn main() -> Result<()> {
     debug!(?cli, "starting monitor");
 
     let lookup_counts = Arc::new(Mutex::new(HashMap::<String, usize>::new()));
-    let ip_to_domain = Arc::new(Mutex::new(HashMap::<IpAddr, String>::new()));
+    let ip_to_domain = get_initial_ip_to_domain_mapping()?;
     let running = Arc::new(AtomicBool::new(true));
     let running_ctrl_c = Arc::clone(&running);
     ctrlc::set_handler(move || {
@@ -101,10 +101,36 @@ fn get_default_interface() -> Result<String> {
         .ok_or_else(|| anyhow::anyhow!("no capture devices found"))
 }
 
+fn get_initial_ip_to_domain_mapping() -> Result<HashMap<IpAddr, String>> {
+    let hostnames = vec![
+        "api.githubcopilot.com",
+        "api.enterprise.githubcopilot.com",
+        "api.individual.githubcopilot.com",
+        "api.githubcopilot.com",
+        "proxy.enterprise.githubcopilot.com",
+        "proxy.individual.githubcopilot.com",
+    ];
+
+    let mut ip_to_domain = HashMap::new();
+
+    for hostname in hostnames {
+        let socket_addr = format!("{}:443", hostname);
+        let addrs = socket_addr
+            .to_socket_addrs()
+            .with_context(|| format!("Failed to resolve hostname: {}", hostname))?;
+
+        for addr in addrs {
+            ip_to_domain.insert(addr.ip(), hostname.to_string());
+        }
+    }
+
+    Ok(ip_to_domain)
+}
+
 fn capture_packets(
     interface: String,
     lookup_counts_ref: Arc<Mutex<HashMap<String, usize>>>,
-    ip_to_domain: Arc<Mutex<HashMap<IpAddr, String>>>,
+    mut ip_to_domain: HashMap<IpAddr, String>,
     running_ref: Arc<AtomicBool>,
 ) -> Result<()> {
     debug!("attempting to open capture device: {}", interface);
@@ -150,13 +176,9 @@ fn capture_packets(
                     increment_counter(&lookup_counts_ref, domain.clone())?;
 
                     if !ips.is_empty() {
-                        let mut ip_domain_map = ip_to_domain
-                            .lock()
-                            .map_err(|e| anyhow::anyhow!("failed to acquire lock: {}", e))?;
-
                         // Add each resolved IP as a key mapping to this domain
                         for ip in ips {
-                            ip_domain_map.insert(ip, domain.clone());
+                            ip_to_domain.insert(ip, domain.clone());
                         }
                         info!(domain = %domain, "recorded DNS resolution");
                     }
@@ -167,11 +189,7 @@ fn capture_packets(
                     let dest_ip = extract_dest_ip(packet.data)?;
 
                     // Check if this IP belongs to any githubcopilot domain
-                    if let Some(domain) = ip_to_domain
-                        .lock()
-                        .map_err(|e| anyhow::anyhow!("failed to acquire lock: {}", e))?
-                        .get(&dest_ip)
-                    {
+                    if let Some(domain) = ip_to_domain.get(&dest_ip) {
                         info!(domain = %domain, "detected GitHub Copilot HTTP access");
                         increment_counter(&lookup_counts_ref, domain.clone())?;
                     }
