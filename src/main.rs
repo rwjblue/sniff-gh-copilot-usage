@@ -140,7 +140,7 @@ fn capture_packets(
     info!("packet capture started successfully");
 
     capture
-        .filter("udp port 53", true)
+        .filter("port 53 and (udp or tcp)", true)
         .context("setting capture filter")?;
 
     while running_ref.load(Ordering::Relaxed) {
