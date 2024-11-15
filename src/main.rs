@@ -9,7 +9,7 @@ use std::sync::{
 };
 use std::thread;
 use std::time::Duration;
-use tracing::{debug, error, info, trace};
+use tracing::{debug, error, info};
 use tracing_subscriber::EnvFilter;
 
 #[derive(Parser, Debug)]
@@ -83,9 +83,10 @@ fn main() -> Result<()> {
         anyhow::anyhow!("capture thread panicked: {:?}", e)
     })??;
 
-    debug!("printing final results");
-    print_lookup_table(&lookup_counts);
     info!("DNS monitor completed successfully");
+    println!("\n\n");
+
+    print_lookup_table(&lookup_counts);
     Ok(())
 }
 
@@ -218,12 +219,23 @@ fn get_dns_offset(packet_data: &[u8]) -> Option<usize> {
     }
 }
 
-/// Prints out the lookup table
 fn print_lookup_table(lookup_counts: &Arc<Mutex<HashMap<String, usize>>>) {
     let counts = lookup_counts.lock().unwrap();
-    println!("{:<30} | {:<5}", "Domain", "Count");
-    println!("{:-<30}-+-{:-<5}", "", "");
+    let domain_width = counts
+        .keys()
+        .map(|s| s.len())
+        .max()
+        .unwrap_or(0)
+        .max("Domain".len());
+
+    println!(
+        "{:<width$} | {:<5}",
+        "Domain",
+        "Count",
+        width = domain_width
+    );
+    println!("{:-<width$}-+-{:-<5}", "", "", width = domain_width);
     for (domain, count) in counts.iter() {
-        println!("{:<30} | {:<5}", domain, count);
+        println!("{:<width$} | {:<5}", domain, count, width = domain_width);
     }
 }
