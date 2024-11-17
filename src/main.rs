@@ -110,15 +110,13 @@ impl Monitor {
             }
         }
 
-        if let Some(_payload) = skip_network_headers(&packet.data) {
-            if let Ok(dest_ip) = extract_dest_ip(&packet.data) {
-                let ip_map = self
-                    .ip_to_domain
-                    .lock()
-                    .map_err(|e| anyhow::anyhow!("Failed to acquire ip_to_domain lock: {}", e))?;
-                if let Some(domain) = ip_map.get(&dest_ip) {
-                    self.increment_counter(domain.clone())?;
-                }
+        if let Ok(dest_ip) = extract_dest_ip(&packet.data) {
+            let ip_map = self
+                .ip_to_domain
+                .lock()
+                .map_err(|e| anyhow::anyhow!("Failed to acquire ip_to_domain lock: {}", e))?;
+            if let Some(domain) = ip_map.get(&dest_ip) {
+                self.increment_counter(domain.clone())?;
             }
         }
 
@@ -126,7 +124,14 @@ impl Monitor {
     }
 
     fn increment_counter(&self, domain: String) -> Result<()> {
-        increment_counter(&self.lookup_counts, domain)
+        self.lookup_counts
+            .lock()
+            .map_err(|e| anyhow::anyhow!("failed to acquire lock: {}", e))?
+            .entry(domain)
+            .and_modify(|c| *c += 1)
+            .or_insert(1);
+
+        Ok(())
     }
 }
 
@@ -367,63 +372,6 @@ fn get_dns_offset(packet_data: &[u8]) -> Option<usize> {
     } else {
         Some(dns_start)
     }
-}
-
-fn skip_network_headers(packet_data: &[u8]) -> Option<&[u8]> {
-    if packet_data.len() < 34 {
-        return None;
-    }
-
-    // Ethernet header is 14 bytes
-    let eth_header_len = 14;
-    let ip_header_start = eth_header_len;
-    let ip_header = &packet_data[ip_header_start..];
-
-    if ip_header.len() < 20 {
-        return None;
-    }
-
-    // IP header length is determined by the IHL field (lower 4 bits of the first byte)
-    let ihl = ip_header[0] & 0x0F;
-    let ip_header_len = (ihl * 4) as usize;
-
-    if ip_header_len < 20 {
-        return None;
-    }
-
-    let tcp_header_start = ip_header_start + ip_header_len;
-
-    if packet_data.len() < tcp_header_start + 20 {
-        return None;
-    }
-
-    let tcp_header = &packet_data[tcp_header_start..];
-
-    // TCP header length is determined by the Data Offset field (upper 4 bits of the 13th byte)
-    let data_offset = (tcp_header[12] >> 4) & 0x0F;
-    let tcp_header_len = (data_offset * 4) as usize;
-
-    if tcp_header_len < 20 {
-        return None;
-    }
-
-    let payload_start = tcp_header_start + tcp_header_len;
-
-    if payload_start >= packet_data.len() {
-        None
-    } else {
-        Some(&packet_data[payload_start..])
-    }
-}
-
-fn increment_counter(counts: &Arc<Mutex<HashMap<String, usize>>>, key: String) -> Result<()> {
-    counts
-        .lock()
-        .map_err(|e| anyhow::anyhow!("failed to acquire lock: {}", e))?
-        .entry(key)
-        .and_modify(|c| *c += 1)
-        .or_insert(1);
-    Ok(())
 }
 
 fn print_lookup_table(lookup_counts: &HashMap<String, usize>) {
