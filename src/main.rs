@@ -374,3 +374,127 @@ fn print_lookup_table(lookup_counts: &Arc<Mutex<HashMap<String, usize>>>) {
         println!("{:<width$} | {:<5}", domain, count, width = domain_width);
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::Ipv4Addr;
+
+    fn create_mock_dns_packet(domain: &str, response_ips: Vec<Ipv4Addr>) -> Vec<u8> {
+        // Ethernet header (14 bytes)
+        let mut packet = vec![
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // Destination MAC
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // Source MAC
+            0x08, 0x00, // EtherType (IPv4)
+        ];
+
+        // IPv4 header (20 bytes)
+        packet.extend_from_slice(&[
+            0x45, 0x00, // Version, IHL, DSCP, ECN
+            0x00, 0x00, // Total Length
+            0x00, 0x00, // Identification
+            0x00, 0x00, // Flags, Fragment Offset
+            0x40, 0x11, // TTL, Protocol (UDP)
+            0x00, 0x00, // Header Checksum
+            192, 168, 1, 1, // Source IP
+            8, 8, 8, 8, // Destination IP
+        ]);
+
+        // UDP header (8 bytes)
+        packet.extend_from_slice(&[
+            0x00, 0x35, // Source Port (53)
+            0x00, 0x35, // Destination Port (53)
+            0x00, 0x00, // Length
+            0x00, 0x00, // Checksum
+        ]);
+
+        // DNS header (12 bytes)
+        packet.extend_from_slice(&[
+            0x00, 0x01, // Transaction ID
+            0x81, 0x80, // Flags (Standard query response)
+            0x00, 0x01, // Questions
+            0x00, 0x01, // Answer RRs
+            0x00, 0x00, // Authority RRs
+            0x00, 0x00, // Additional RRs
+        ]);
+
+        // DNS question
+        for part in domain.split('.') {
+            packet.push(part.len() as u8);
+            packet.extend_from_slice(part.as_bytes());
+        }
+        packet.push(0x00); // Root label
+
+        // Type A, Class IN
+        packet.extend_from_slice(&[0x00, 0x01, 0x00, 0x01]);
+
+        // DNS answer
+        for ip in response_ips {
+            // Name pointer to question
+            packet.extend_from_slice(&[0xc0, 0x0c]);
+            // Type A, Class IN, TTL 300, Length 4
+            packet.extend_from_slice(&[0x00, 0x01, 0x00, 0x01]);
+            packet.extend_from_slice(&[0x00, 0x00, 0x01, 0x2c]);
+            packet.extend_from_slice(&[0x00, 0x04]);
+            packet.extend_from_slice(&ip.octets());
+        }
+
+        packet
+    }
+
+    fn create_mock_tcp_packet(dest_ip: Ipv4Addr, dest_port: u16) -> Vec<u8> {
+        // Ethernet header (14 bytes)
+        let mut packet = vec![
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // Destination MAC
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // Source MAC
+            0x08, 0x00, // EtherType (IPv4)
+        ];
+
+        // IPv4 header (20 bytes)
+        packet.extend_from_slice(&[
+            0x45, 0x00, // Version, IHL, DSCP, ECN
+            0x00, 0x28, // Total Length
+            0x00, 0x00, // Identification
+            0x00, 0x00, // Flags, Fragment Offset
+            0x40, 0x06, // TTL, Protocol (TCP)
+            0x00, 0x00, // Header Checksum
+            192, 168, 1, 1, // Source IP
+        ]);
+        packet.extend_from_slice(&dest_ip.octets()); // Destination IP
+
+        // TCP header (20 bytes)
+        packet.extend_from_slice(&[
+            0x00, 0x50, // Source Port (80)
+        ]);
+        packet.extend_from_slice(&dest_port.to_be_bytes()); // Destination Port
+        packet.extend_from_slice(&[
+            0x00, 0x00, 0x00, 0x00, // Sequence Number
+            0x00, 0x00, 0x00, 0x00, // Acknowledgment Number
+            0x50, 0x00, // Data Offset, Flags
+            0x00, 0x00, // Window
+            0x00, 0x00, // Checksum
+            0x00, 0x00, // Urgent Pointer
+        ]);
+
+        packet
+    }
+
+    #[test]
+    fn test_extract_githubcopilot_domain() {
+        let test_ip = Ipv4Addr::new(20, 20, 20, 20);
+        let packet = create_mock_dns_packet("api.githubcopilot.com", vec![test_ip]);
+
+        let (domain, ips) = extract_githubcopilot_domain(&packet).unwrap();
+        assert_eq!(domain, "api.githubcopilot.com");
+        assert_eq!(ips, vec![IpAddr::V4(test_ip)]);
+    }
+
+    #[test]
+    fn test_extract_dest_ip() {
+        let test_ip = Ipv4Addr::new(20, 20, 20, 20);
+        let packet = create_mock_tcp_packet(test_ip, 443);
+
+        let extracted_ip = extract_dest_ip(&packet).unwrap();
+        assert_eq!(extracted_ip, IpAddr::V4(test_ip));
+    }
+}
