@@ -10,8 +10,169 @@ use std::sync::{
 };
 use std::thread;
 use std::time::Duration;
-use tracing::{debug, error, info};
+use tracing::{error, info};
 use tracing_subscriber::EnvFilter;
+
+pub struct Monitor {
+    lookup_counts: Arc<Mutex<HashMap<String, usize>>>,
+    ip_to_domain: Arc<Mutex<HashMap<IpAddr, String>>>,
+    running: Arc<AtomicBool>,
+    packet_capturer: Box<dyn PacketCapturer>,
+}
+
+// Trait for packet capture to allow mocking
+pub trait PacketCapturer: Send {
+    fn capture_next(&mut self) -> Result<Option<CapturedPacket>>;
+}
+
+// Struct to represent a captured packet
+#[derive(Clone)]
+pub struct CapturedPacket {
+    pub data: Vec<u8>,
+}
+
+// Real implementation of PacketCapturer
+struct PcapCapturer {
+    capture: Capture<pcap::Active>,
+}
+
+impl PacketCapturer for PcapCapturer {
+    fn capture_next(&mut self) -> Result<Option<CapturedPacket>> {
+        match self.capture.next_packet() {
+            Ok(packet) => Ok(Some(CapturedPacket {
+                data: packet.data.to_vec(),
+            })),
+            Err(pcap::Error::TimeoutExpired) => Ok(None),
+            Err(e) => Err(anyhow::anyhow!("Packet capture error: {}", e)),
+        }
+    }
+}
+
+impl Monitor {
+    pub fn new(
+        packet_capturer: Box<dyn PacketCapturer>,
+        initial_domains: Vec<&str>,
+    ) -> Result<Self> {
+        Ok(Self {
+            lookup_counts: Arc::new(Mutex::new(HashMap::new())),
+            ip_to_domain: Arc::new(Mutex::new(get_initial_ip_to_domain_mapping(
+                initial_domains,
+            )?)),
+            running: Arc::new(AtomicBool::new(true)),
+            packet_capturer,
+        })
+    }
+
+    pub fn start_capture_thread(mut self) -> Result<MonitorHandle> {
+        let running = Arc::clone(&self.running);
+        let lookup_counts = Arc::clone(&self.lookup_counts);
+
+        let (error_tx, error_rx) = std::sync::mpsc::channel();
+
+        let capture_thread = thread::spawn(move || -> Result<()> {
+            while self.running.load(Ordering::Relaxed) {
+                match self.packet_capturer.capture_next() {
+                    Ok(Some(packet)) => {
+                        if let Err(e) = self.process_packet(&packet) {
+                            error!("Error processing packet: {}", e);
+                            error_tx.send(e).ok();
+                            break;
+                        }
+                    }
+                    Ok(None) => continue, // Timeout, try again
+                    Err(e) => {
+                        error_tx.send(e).ok();
+                        break;
+                    }
+                }
+            }
+            Ok(())
+        });
+
+        Ok(MonitorHandle {
+            running,
+            capture_thread: Some(capture_thread),
+            error_rx,
+            lookup_counts,
+        })
+    }
+
+    fn process_packet(&self, packet: &CapturedPacket) -> Result<()> {
+        if let Some((domain, ips)) = extract_githubcopilot_domain(&packet.data) {
+            self.increment_counter(domain.clone())?;
+
+            let mut ip_map = self
+                .ip_to_domain
+                .lock()
+                .map_err(|e| anyhow::anyhow!("Failed to acquire ip_to_domain lock: {}", e))?;
+            for ip in ips {
+                ip_map.insert(ip, domain.clone());
+            }
+        }
+
+        if let Some(_payload) = skip_network_headers(&packet.data) {
+            if let Ok(dest_ip) = extract_dest_ip(&packet.data) {
+                let ip_map = self
+                    .ip_to_domain
+                    .lock()
+                    .map_err(|e| anyhow::anyhow!("Failed to acquire ip_to_domain lock: {}", e))?;
+                if let Some(domain) = ip_map.get(&dest_ip) {
+                    self.increment_counter(domain.clone())?;
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    fn increment_counter(&self, domain: String) -> Result<()> {
+        increment_counter(&self.lookup_counts, domain)
+    }
+}
+
+pub struct MonitorHandle {
+    running: Arc<AtomicBool>,
+    capture_thread: Option<thread::JoinHandle<Result<()>>>,
+    error_rx: std::sync::mpsc::Receiver<anyhow::Error>,
+    lookup_counts: Arc<Mutex<HashMap<String, usize>>>,
+}
+
+impl MonitorHandle {
+    pub fn stop(&self) {
+        self.running.store(false, Ordering::Relaxed);
+    }
+
+    pub fn wait(mut self) -> Result<HashMap<String, usize>> {
+        while self.running.load(Ordering::Relaxed) {
+            if let Ok(error) = self.error_rx.try_recv() {
+                error!(error = %error, "received capture error");
+                self.stop();
+                break;
+            }
+            thread::sleep(Duration::from_millis(100));
+        }
+
+        if let Some(thread) = self.capture_thread.take() {
+            thread
+                .join()
+                .map_err(|e| anyhow::anyhow!("Capture thread panicked: {:?}", e))??;
+        }
+
+        Ok(self
+            .lookup_counts
+            .lock()
+            .map_err(|e| anyhow::anyhow!("Failed to acquire counts lock: {}", e))?
+            .clone())
+    }
+
+    pub fn get_counts(&self) -> Result<HashMap<String, usize>> {
+        Ok(self
+            .lookup_counts
+            .lock()
+            .map_err(|e| anyhow::anyhow!("Failed to acquire lock: {}", e))?
+            .clone())
+    }
+}
 
 #[derive(Parser, Debug)]
 #[command(about = "Monitor usage of domains ending in githubcopilot.com")]
@@ -21,75 +182,78 @@ struct Cli {
     interface: Option<String>,
 }
 
-fn main() -> Result<()> {
+fn setup_logging() {
     tracing_subscriber::fmt()
         .with_env_filter(
             EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("debug")),
         )
         .init();
+}
 
-    let cli = Cli::parse();
-    debug!(?cli, "starting monitor");
+fn get_interface_name(cli: &Cli) -> Result<String> {
+    Ok(cli
+        .interface
+        .clone()
+        .unwrap_or_else(|| {
+            get_default_interface()
+                .context("Failed to detect default interface")
+                .unwrap_or_else(|e| {
+                    eprintln!("Warning: {}, falling back to en0", e);
+                    "en0".to_string()
+                })
+        })
+        .to_string())
+}
 
-    let lookup_counts = Arc::new(Mutex::new(HashMap::<String, usize>::new()));
-    let ip_to_domain = get_initial_ip_to_domain_mapping()?;
-    let running = Arc::new(AtomicBool::new(true));
-    let running_ctrl_c = Arc::clone(&running);
+fn setup_ctrlc_handler(handle: &MonitorHandle) -> Result<()> {
+    let running = Arc::clone(&handle.running);
+
     ctrlc::set_handler(move || {
         info!("Received Ctrl-C!");
-        running_ctrl_c.store(false, Ordering::Relaxed);
-        info!(
-            "Set running to false: {}",
-            running_ctrl_c.load(Ordering::Relaxed)
-        );
+        running.store(false, Ordering::Relaxed);
     })?;
 
-    debug!("Registered Ctrl-C handler");
-
-    let interface = cli.interface.unwrap_or_else(|| {
-        get_default_interface()
-            .context("Failed to detect default interface")
-            .unwrap_or_else(|e| {
-                eprintln!("Warning: {}, falling back to en0", e);
-                "en0".to_string()
-            })
-    });
-
-    let lookup_counts_ref = Arc::clone(&lookup_counts);
-    let running_ref = Arc::clone(&running);
-
-    let (error_tx, error_rx) = std::sync::mpsc::channel();
-    debug!(interface = ?interface, "starting packet capture");
-
-    let capture_thread = thread::spawn(move || -> Result<()> {
-        if let Err(e) = capture_packets(interface, lookup_counts_ref, ip_to_domain, running_ref) {
-            error_tx.send(e).expect("Failed to send error");
-        }
-
-        Ok(())
-    });
-
-    while running.load(Ordering::Relaxed) {
-        if let Ok(error) = error_rx.try_recv() {
-            error!(error = %error, "received capture error");
-            running.store(false, Ordering::Relaxed);
-            break;
-        }
-        thread::sleep(Duration::from_secs(1));
-    }
-
-    debug!("initiating shutdown");
-    running.store(false, Ordering::Relaxed);
-    capture_thread.join().map_err(|e| {
-        error!(?e, "capture thread panicked");
-        anyhow::anyhow!("capture thread panicked: {:?}", e)
-    })??;
-
-    info!("monitor completed successfully");
-    println!("\n\n");
-
-    print_lookup_table(&lookup_counts);
     Ok(())
+}
+
+fn main() -> Result<()> {
+    setup_logging();
+    let cli = Cli::parse();
+
+    let interface = get_interface_name(&cli)?;
+    let capturer = create_packet_capturer(&interface)?;
+
+    let domains = vec![
+        "api.githubcopilot.com",
+        "api.enterprise.githubcopilot.com",
+        "api.individual.githubcopilot.com",
+        "proxy.enterprise.githubcopilot.com",
+        "proxy.individual.githubcopilot.com",
+    ];
+
+    let monitor = Monitor::new(capturer, domains)?;
+    let handle = monitor.start_capture_thread()?;
+
+    setup_ctrlc_handler(&handle)?;
+
+    let final_counts = handle.wait()?;
+    print_lookup_table(&final_counts);
+    Ok(())
+}
+
+fn create_packet_capturer(interface: &str) -> Result<Box<dyn PacketCapturer>> {
+    let device = Capture::from_device(interface)?;
+    let mut capture = device
+        .promisc(true)
+        .timeout(100)
+        .immediate_mode(true)
+        .open()?;
+
+    capture
+        .filter("port 53 or port 80 or port 443", true)
+        .context("setting capture filter")?;
+
+    Ok(Box::new(PcapCapturer { capture }))
 }
 
 fn get_default_interface() -> Result<String> {
@@ -101,16 +265,7 @@ fn get_default_interface() -> Result<String> {
         .ok_or_else(|| anyhow::anyhow!("no capture devices found"))
 }
 
-fn get_initial_ip_to_domain_mapping() -> Result<HashMap<IpAddr, String>> {
-    let hostnames = vec![
-        "api.githubcopilot.com",
-        "api.enterprise.githubcopilot.com",
-        "api.individual.githubcopilot.com",
-        "api.githubcopilot.com",
-        "proxy.enterprise.githubcopilot.com",
-        "proxy.individual.githubcopilot.com",
-    ];
-
+fn get_initial_ip_to_domain_mapping(hostnames: Vec<&str>) -> Result<HashMap<IpAddr, String>> {
     let mut ip_to_domain = HashMap::new();
 
     for hostname in hostnames {
@@ -125,89 +280,6 @@ fn get_initial_ip_to_domain_mapping() -> Result<HashMap<IpAddr, String>> {
     }
 
     Ok(ip_to_domain)
-}
-
-fn capture_packets(
-    interface: String,
-    lookup_counts_ref: Arc<Mutex<HashMap<String, usize>>>,
-    mut ip_to_domain: HashMap<IpAddr, String>,
-    running_ref: Arc<AtomicBool>,
-) -> Result<()> {
-    debug!("attempting to open capture device: {}", interface);
-
-    let device = match Capture::from_device(interface.as_str()) {
-        Ok(device) => {
-            debug!("device opened, configuring capture");
-            device
-        }
-        Err(e) => {
-            error!("failed to open device {}: {}", interface, e);
-            return Err(anyhow::anyhow!("failed to open capture device: {}", e));
-        }
-    };
-
-    let mut capture = match device
-        .promisc(true)
-        .timeout(100)
-        .immediate_mode(true)
-        .open()
-    {
-        Ok(cap) => {
-            debug!("capture configured successfully");
-            cap
-        }
-        Err(e) => {
-            error!("failed to start capture: {}", e);
-            return Err(anyhow::anyhow!("failed to start capture: {}", e));
-        }
-    };
-
-    info!("packet capture started successfully");
-
-    capture
-        .filter("port 53 or port 80 or port 443", true)
-        .context("setting capture filter")?;
-
-    while running_ref.load(Ordering::Relaxed) {
-        match capture.next_packet() {
-            Ok(packet) => {
-                if let Some((domain, ips)) = extract_githubcopilot_domain(packet.data) {
-                    info!(domain = %domain, "detected GitHub Copilot DNS lookup");
-                    increment_counter(&lookup_counts_ref, domain.clone())?;
-
-                    if !ips.is_empty() {
-                        // Add each resolved IP as a key mapping to this domain
-                        for ip in ips {
-                            ip_to_domain.insert(ip, domain.clone());
-                        }
-                        info!(domain = %domain, "recorded DNS resolution");
-                    }
-                }
-
-                // Process HTTP/HTTPS packets
-                if let Some(payload) = skip_network_headers(packet.data) {
-                    let dest_ip = extract_dest_ip(packet.data)?;
-
-                    // Check if this IP belongs to any githubcopilot domain
-                    if let Some(domain) = ip_to_domain.get(&dest_ip) {
-                        info!(domain = %domain, "detected GitHub Copilot HTTP access");
-                        increment_counter(&lookup_counts_ref, domain.clone())?;
-                    }
-                }
-            }
-            Err(pcap::Error::TimeoutExpired) => {
-                // Timeout is expected, just continue the loop
-                continue;
-            }
-            Err(e) => {
-                error!(error = %e, "packet capture error");
-
-                return Err(anyhow::anyhow!("packet capture error: {}", e));
-            }
-        }
-    }
-    debug!("capture thread shutting down");
-    Ok(())
 }
 
 fn extract_dest_ip(packet_data: &[u8]) -> Result<IpAddr> {
@@ -354,9 +426,8 @@ fn increment_counter(counts: &Arc<Mutex<HashMap<String, usize>>>, key: String) -
     Ok(())
 }
 
-fn print_lookup_table(lookup_counts: &Arc<Mutex<HashMap<String, usize>>>) {
-    let counts = lookup_counts.lock().unwrap();
-    let domain_width = counts
+fn print_lookup_table(lookup_counts: &HashMap<String, usize>) {
+    let domain_width = lookup_counts
         .keys()
         .map(|s| s.len())
         .max()
@@ -370,7 +441,7 @@ fn print_lookup_table(lookup_counts: &Arc<Mutex<HashMap<String, usize>>>) {
         width = domain_width
     );
     println!("{:-<width$}-+-{:-<5}", "", "", width = domain_width);
-    for (domain, count) in counts.iter() {
+    for (domain, count) in lookup_counts.iter() {
         println!("{:<width$} | {:<5}", domain, count, width = domain_width);
     }
 }
@@ -379,6 +450,24 @@ fn print_lookup_table(lookup_counts: &Arc<Mutex<HashMap<String, usize>>>) {
 mod tests {
     use super::*;
     use std::net::Ipv4Addr;
+
+    // Mock packet capturer for testing
+    struct MockCapturer {
+        packets: Vec<CapturedPacket>,
+        current: usize,
+    }
+
+    impl PacketCapturer for MockCapturer {
+        fn capture_next(&mut self) -> Result<Option<CapturedPacket>> {
+            if self.current < self.packets.len() {
+                let packet = self.packets[self.current].clone();
+                self.current += 1;
+                Ok(Some(packet))
+            } else {
+                Ok(None)
+            }
+        }
+    }
 
     fn create_mock_dns_packet(domain: &str, response_ips: Vec<Ipv4Addr>) -> Vec<u8> {
         // Ethernet header (14 bytes)
@@ -496,5 +585,30 @@ mod tests {
 
         let extracted_ip = extract_dest_ip(&packet).unwrap();
         assert_eq!(extracted_ip, IpAddr::V4(test_ip));
+    }
+
+    #[test]
+    fn test_monitor_threaded_capture() -> Result<()> {
+        let dns_packet =
+            create_mock_dns_packet("api.githubcopilot.com", vec![Ipv4Addr::new(20, 20, 20, 20)]);
+
+        let mock_capturer = MockCapturer {
+            packets: vec![CapturedPacket { data: dns_packet }],
+            current: 0,
+        };
+
+        let monitor = Monitor::new(Box::new(mock_capturer), vec!["api.githubcopilot.com"])?;
+
+        let handle = monitor.start_capture_thread()?;
+
+        // Give it a moment to process
+        thread::sleep(Duration::from_millis(100));
+
+        handle.stop();
+        let counts = handle.wait()?;
+
+        assert_eq!(counts.get("api.githubcopilot.com"), Some(&1));
+
+        Ok(())
     }
 }
