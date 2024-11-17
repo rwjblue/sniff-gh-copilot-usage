@@ -243,6 +243,7 @@ fn main() -> Result<()> {
 
     let final_counts = handle.wait()?;
     print_lookup_table(&final_counts);
+
     Ok(())
 }
 
@@ -397,6 +398,7 @@ fn print_lookup_table(lookup_counts: &HashMap<String, usize>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use insta::assert_debug_snapshot;
     use std::net::Ipv4Addr;
 
     // Mock packet capturer for testing
@@ -556,6 +558,140 @@ mod tests {
         let counts = handle.wait()?;
 
         assert_eq!(counts.get("api.githubcopilot.com"), Some(&1));
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_monitor_multiple_lookups() -> Result<()> {
+        let dns_packet1 =
+            create_mock_dns_packet("api.githubcopilot.com", vec![Ipv4Addr::new(20, 20, 20, 20)]);
+        let dns_packet2 =
+            create_mock_dns_packet("api.githubcopilot.com", vec![Ipv4Addr::new(20, 20, 20, 21)]);
+        let tcp_packet = create_mock_tcp_packet(Ipv4Addr::new(20, 20, 20, 20), 443);
+
+        let mock_capturer = MockCapturer {
+            packets: vec![
+                CapturedPacket { data: dns_packet1 },
+                CapturedPacket { data: dns_packet2 },
+                CapturedPacket { data: tcp_packet },
+            ],
+            current: 0,
+        };
+
+        let monitor = Monitor::new(Box::new(mock_capturer), vec!["api.githubcopilot.com"])?;
+        let handle = monitor.start_capture_thread()?;
+        thread::sleep(Duration::from_millis(100));
+        handle.stop();
+        let counts = handle.wait()?;
+
+        assert_debug_snapshot!(counts, @r###"
+        {
+            "api.githubcopilot.com": 3,
+        }
+        "###);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_monitor_multiple_domains() -> Result<()> {
+        let dns_packet1 =
+            create_mock_dns_packet("api.githubcopilot.com", vec![Ipv4Addr::new(20, 20, 20, 20)]);
+        let dns_packet2 = create_mock_dns_packet(
+            "proxy.enterprise.githubcopilot.com",
+            vec![Ipv4Addr::new(20, 20, 20, 21)],
+        );
+
+        let mock_capturer = MockCapturer {
+            packets: vec![
+                CapturedPacket { data: dns_packet1 },
+                CapturedPacket { data: dns_packet2 },
+            ],
+            current: 0,
+        };
+
+        let monitor = Monitor::new(
+            Box::new(mock_capturer),
+            vec![
+                "api.githubcopilot.com",
+                "proxy.enterprise.githubcopilot.com",
+            ],
+        )?;
+        let handle = monitor.start_capture_thread()?;
+        thread::sleep(Duration::from_millis(100));
+        handle.stop();
+        let counts = handle.wait()?;
+
+        assert_debug_snapshot!(counts, @r###"
+        {
+            "proxy.enterprise.githubcopilot.com": 1,
+            "api.githubcopilot.com": 1,
+        }
+        "###);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_monitor_invalid_packets() -> Result<()> {
+        let invalid_packet = vec![0; 20]; // Too short to be valid
+        let valid_dns =
+            create_mock_dns_packet("api.githubcopilot.com", vec![Ipv4Addr::new(20, 20, 20, 20)]);
+
+        let mock_capturer = MockCapturer {
+            packets: vec![
+                CapturedPacket {
+                    data: invalid_packet,
+                },
+                CapturedPacket { data: valid_dns },
+            ],
+            current: 0,
+        };
+
+        let monitor = Monitor::new(Box::new(mock_capturer), vec!["api.githubcopilot.com"])?;
+        let handle = monitor.start_capture_thread()?;
+        thread::sleep(Duration::from_millis(100));
+        handle.stop();
+        let counts = handle.wait()?;
+
+        assert_debug_snapshot!(counts, @r###"
+        {
+            "api.githubcopilot.com": 1,
+        }
+        "###);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_monitor_get_counts_during_capture() -> Result<()> {
+        let dns_packet =
+            create_mock_dns_packet("api.githubcopilot.com", vec![Ipv4Addr::new(20, 20, 20, 20)]);
+
+        let mock_capturer = MockCapturer {
+            packets: vec![CapturedPacket { data: dns_packet }],
+            current: 0,
+        };
+
+        let monitor = Monitor::new(Box::new(mock_capturer), vec!["api.githubcopilot.com"])?;
+        let handle = monitor.start_capture_thread()?;
+        thread::sleep(Duration::from_millis(50));
+
+        let mid_counts = handle.get_counts()?;
+        assert_debug_snapshot!(mid_counts, @r###"
+        {
+            "api.githubcopilot.com": 1,
+        }
+        "###);
+
+        handle.stop();
+        let final_counts = handle.wait()?;
+        assert_debug_snapshot!(final_counts, @r###"
+        {
+            "api.githubcopilot.com": 1,
+        }
+        "###);
 
         Ok(())
     }
