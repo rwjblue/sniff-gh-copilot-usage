@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use clap::Parser;
 use pcap::{Capture, Device};
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 use std::net::{IpAddr, ToSocketAddrs};
 use std::sync::Mutex;
 use std::sync::{
@@ -14,8 +14,8 @@ use tracing::{debug, error, info};
 use tracing_subscriber::EnvFilter;
 
 pub struct Monitor {
-    lookup_counts: Arc<Mutex<HashMap<String, usize>>>,
-    ip_to_domain: Arc<Mutex<HashMap<IpAddr, String>>>,
+    lookup_counts: Arc<Mutex<BTreeMap<String, usize>>>,
+    ip_to_domain: Arc<Mutex<BTreeMap<IpAddr, String>>>,
     running: Arc<AtomicBool>,
     packet_capturer: Box<dyn PacketCapturer>,
 }
@@ -54,7 +54,7 @@ impl Monitor {
         initial_domains: Vec<&str>,
     ) -> Result<Self> {
         Ok(Self {
-            lookup_counts: Arc::new(Mutex::new(HashMap::new())),
+            lookup_counts: Arc::new(Mutex::new(BTreeMap::new())),
             ip_to_domain: Arc::new(Mutex::new(get_initial_ip_to_domain_mapping(
                 initial_domains,
             )?)),
@@ -139,7 +139,7 @@ pub struct MonitorHandle {
     running: Arc<AtomicBool>,
     capture_thread: Option<thread::JoinHandle<Result<()>>>,
     error_rx: std::sync::mpsc::Receiver<anyhow::Error>,
-    lookup_counts: Arc<Mutex<HashMap<String, usize>>>,
+    lookup_counts: Arc<Mutex<BTreeMap<String, usize>>>,
 }
 
 impl MonitorHandle {
@@ -147,7 +147,7 @@ impl MonitorHandle {
         self.running.store(false, Ordering::Relaxed);
     }
 
-    pub fn wait(mut self) -> Result<HashMap<String, usize>> {
+    pub fn wait(mut self) -> Result<BTreeMap<String, usize>> {
         while self.running.load(Ordering::Relaxed) {
             if let Ok(error) = self.error_rx.try_recv() {
                 error!(error = %error, "received capture error");
@@ -170,7 +170,7 @@ impl MonitorHandle {
             .clone())
     }
 
-    pub fn get_counts(&self) -> Result<HashMap<String, usize>> {
+    pub fn get_counts(&self) -> Result<BTreeMap<String, usize>> {
         Ok(self
             .lookup_counts
             .lock()
@@ -275,8 +275,8 @@ fn get_default_interface() -> Result<String> {
         .ok_or_else(|| anyhow::anyhow!("no capture devices found"))
 }
 
-fn get_initial_ip_to_domain_mapping(hostnames: Vec<&str>) -> Result<HashMap<IpAddr, String>> {
-    let mut ip_to_domain = HashMap::new();
+fn get_initial_ip_to_domain_mapping(hostnames: Vec<&str>) -> Result<BTreeMap<IpAddr, String>> {
+    let mut ip_to_domain = BTreeMap::new();
 
     for hostname in hostnames {
         let socket_addr = format!("{}:443", hostname);
@@ -379,7 +379,7 @@ fn get_dns_offset(packet_data: &[u8]) -> Option<usize> {
     }
 }
 
-fn print_lookup_table(lookup_counts: &HashMap<String, usize>) {
+fn print_lookup_table(lookup_counts: &BTreeMap<String, usize>) {
     let domain_width = lookup_counts
         .keys()
         .map(|s| s.len())
@@ -629,8 +629,8 @@ mod tests {
 
         assert_debug_snapshot!(counts, @r###"
         {
-            "proxy.enterprise.githubcopilot.com": 1,
             "api.githubcopilot.com": 1,
+            "proxy.enterprise.githubcopilot.com": 1,
         }
         "###);
 
