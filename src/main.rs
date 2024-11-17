@@ -10,7 +10,7 @@ use std::sync::{
 };
 use std::thread;
 use std::time::Duration;
-use tracing::{error, info};
+use tracing::{debug, error, info};
 use tracing_subscriber::EnvFilter;
 
 pub struct Monitor {
@@ -223,9 +223,12 @@ fn setup_ctrlc_handler(handle: &MonitorHandle) -> Result<()> {
 
 fn main() -> Result<()> {
     setup_logging();
+    info!("Starting up...");
     let cli = Cli::parse();
 
     let interface = get_interface_name(&cli)?;
+    debug!("Using network interface: {}", interface);
+
     let capturer = create_packet_capturer(&interface)?;
 
     let domains = vec![
@@ -240,6 +243,7 @@ fn main() -> Result<()> {
     let handle = monitor.start_capture_thread()?;
 
     setup_ctrlc_handler(&handle)?;
+    info!("Ready! Press Ctrl+C to stop monitoring.");
 
     let final_counts = handle.wait()?;
     print_lookup_table(&final_counts);
